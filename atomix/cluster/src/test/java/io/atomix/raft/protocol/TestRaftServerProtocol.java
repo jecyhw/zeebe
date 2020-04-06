@@ -48,6 +48,7 @@ public class TestRaftServerProtocol extends TestRaftProtocol implements RaftServ
   private Function<PollRequest, CompletableFuture<PollResponse>> pollHandler;
   private Function<VoteRequest, CompletableFuture<VoteResponse>> voteHandler;
   private Function<AppendRequest, CompletableFuture<AppendResponse>> appendHandler;
+  private volatile boolean isConnected = true;
 
   public TestRaftServerProtocol(
       final MemberId memberId,
@@ -56,6 +57,27 @@ public class TestRaftServerProtocol extends TestRaftProtocol implements RaftServ
       final ThreadContext context) {
     super(servers, clients, context);
     servers.put(memberId, this);
+  }
+
+  public void disconnect() {
+    isConnected = false;
+  }
+
+  public void reconnect() {
+    isConnected = true;
+  }
+
+  public boolean isConnected() {
+    return isConnected;
+  }
+
+  @Override
+  TestRaftServerProtocol server(final MemberId memberId) {
+    final TestRaftServerProtocol otherServer = super.server(memberId);
+    if (!isConnected || otherServer == null) {
+      return null;
+    }
+    return otherServer.isConnected() ? otherServer : null;
   }
 
   @Override

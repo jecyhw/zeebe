@@ -23,9 +23,12 @@ import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Matchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import io.atomix.cluster.ClusterMembershipService;
 import io.atomix.cluster.MemberId;
 import io.atomix.primitive.PrimitiveInfo;
@@ -53,6 +56,7 @@ import io.atomix.raft.primitive.TestPrimitiveImpl;
 import io.atomix.raft.primitive.TestPrimitiveService;
 import io.atomix.raft.primitive.TestPrimitiveType;
 import io.atomix.raft.protocol.TestRaftProtocolFactory;
+import io.atomix.raft.protocol.TestRaftServerProtocol;
 import io.atomix.raft.storage.RaftStorage;
 import io.atomix.raft.storage.log.RaftLogReader;
 import io.atomix.raft.storage.log.entry.CloseSessionEntry;
@@ -71,6 +75,7 @@ import io.atomix.raft.storage.snapshot.SnapshotStore;
 import io.atomix.raft.storage.system.Configuration;
 import io.atomix.raft.utils.LoadMonitor;
 import io.atomix.storage.StorageLevel;
+import io.atomix.storage.journal.Indexed;
 import io.atomix.storage.journal.JournalReader.Mode;
 import io.atomix.storage.statistics.StorageStatistics;
 import io.atomix.utils.concurrent.Futures;
@@ -88,6 +93,7 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -108,6 +114,7 @@ import org.junit.Ignore;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
+import org.mockito.Mockito;
 import org.slf4j.LoggerFactory;
 
 /** Raft test. */
@@ -148,6 +155,7 @@ public class RaftTest extends ConcurrentTestCase {
   protected volatile TestRaftProtocolFactory protocolFactory;
   protected volatile ThreadContext context;
   private Path directory;
+  private final Map<MemberId, TestRaftServerProtocol> serverProtocols = Maps.newConcurrentMap();
 
   @Before
   @After
@@ -262,12 +270,14 @@ public class RaftTest extends ConcurrentTestCase {
   private RaftServer createServer(
       final MemberId memberId,
       final Function<RaftServer.Builder, RaftServer.Builder> configurator) {
+    final TestRaftServerProtocol protocol = protocolFactory.newSpyServerProtocol(memberId);
     final RaftServer.Builder defaults =
         RaftServer.builder(memberId)
             .withMembershipService(mock(ClusterMembershipService.class))
-            .withProtocol(protocolFactory.newServerProtocol(memberId));
+            .withProtocol(protocol);
     final RaftServer server = configurator.apply(defaults).build();
 
+    serverProtocols.put(memberId, protocol);
     servers.add(server);
     return server;
   }
@@ -464,8 +474,7 @@ public class RaftTest extends ConcurrentTestCase {
   @Test
   public void testLeaderLeave() throws Throwable {
     final List<RaftServer> servers = createServers(3);
-    final RaftServer server =
-        servers.stream().filter(s -> s.getRole() == RaftServer.Role.LEADER).findFirst().get();
+    final RaftServer server = getLeader(servers).get();
     server.leave().thenRun(this::resume);
     await(30000);
   }
@@ -1101,8 +1110,7 @@ public class RaftTest extends ConcurrentTestCase {
       await(30000, 2);
     }
 
-    final RaftServer leader =
-        servers.stream().filter(s -> s.getRole() == RaftServer.Role.LEADER).findFirst().get();
+    final RaftServer leader = getLeader(servers).get();
     leader.shutdown().get(10, TimeUnit.SECONDS);
 
     for (int i = 0; i < 10; i++) {
@@ -1160,8 +1168,7 @@ public class RaftTest extends ConcurrentTestCase {
           resume();
         });
 
-    final RaftServer leader =
-        servers.stream().filter(s -> s.getRole() == Role.LEADER).findFirst().get();
+    final RaftServer leader = getLeader(servers).get();
     final MemberId memberId = new MemberId(leader.name());
     leader.shutdown().get(10, TimeUnit.SECONDS);
 
@@ -1275,8 +1282,7 @@ public class RaftTest extends ConcurrentTestCase {
 
     primitive.sendEvent(true).thenRun(this::resume);
 
-    final RaftServer leader =
-        servers.stream().filter(s -> s.getRole() == RaftServer.Role.LEADER).findFirst().get();
+    final RaftServer leader = getLeader(servers).get();
     leader.shutdown().get(10, TimeUnit.SECONDS);
 
     await(30000);
@@ -1657,8 +1663,7 @@ public class RaftTest extends ConcurrentTestCase {
   public void testRoleChangeNotificationAfterInitialEntryOnLeader() throws Throwable {
     // given
     final List<RaftServer> servers = createServers(3);
-    final RaftServer leader =
-        servers.stream().filter(s -> s.getRole() == RaftServer.Role.LEADER).findFirst().get();
+    final RaftServer leader = getLeader(servers).get();
     final CountDownLatch transitionCompleted = new CountDownLatch(1);
     servers.stream()
         .forEach(
@@ -1672,6 +1677,14 @@ public class RaftTest extends ConcurrentTestCase {
     // then
     transitionCompleted.await(10, TimeUnit.SECONDS);
     assertEquals(0, transitionCompleted.getCount());
+  }
+
+  private Optional<RaftServer> getLeader(final List<RaftServer> servers) {
+    return servers.stream().filter(s -> s.getRole() == Role.LEADER).findFirst();
+  }
+
+  private List<RaftServer> getFollowers(final List<RaftServer> servers) {
+    return servers.stream().filter(s -> s.getRole() == Role.FOLLOWER).collect(Collectors.toList());
   }
 
   private void assertLastReadInitialEntry(
@@ -1717,6 +1730,108 @@ public class RaftTest extends ConcurrentTestCase {
     assertEquals(0, secondListener.getCount());
 
     assertEquals(server.getRole(), Role.INACTIVE);
+  }
+
+  @Test
+  public void shouldLeaderStepDownOnDisconnect() throws Throwable {
+    final List<RaftServer> servers = createServers(3);
+    final RaftServer leader = getLeader(servers).get();
+    final MemberId leaderId = leader.getContext().getCluster().getMember().memberId();
+
+    // when
+    serverProtocols.get(leaderId).disconnect();
+
+    // then
+    waitUntil(() -> !leader.isLeader(), 100);
+  }
+
+  @Test
+  public void shouldReconnect() throws Throwable {
+    final List<RaftServer> servers = createServers(3);
+    final RaftServer leader = getLeader(servers).get();
+    final MemberId leaderId = leader.getContext().getCluster().getMember().memberId();
+    final AtomicLong commitIndex = new AtomicLong();
+    leader
+        .getContext()
+        .addCommitListener(
+            new RaftCommitListener() {
+              @Override
+              public <T extends RaftLogEntry> void onCommit(final Indexed<T> entry) {
+                commitIndex.set(entry.index());
+              }
+            });
+    final RaftClient client = createClient();
+    final TestPrimitive primitive = createPrimitive(client);
+    primitive.onEvent(
+        event -> {
+          threadAssertNotNull(event);
+          resume();
+        });
+
+    for (int i = 0; i < 1_000; i++) {
+      primitive.sendEvent(true);
+    }
+    await(30000, 500);
+
+    // when
+    serverProtocols.get(leaderId).disconnect();
+    waitUntil(() -> !leader.isLeader(), 100);
+    for (int i = 0; i < 2_000; i++) {
+      primitive.sendEvent(true);
+    }
+    final long lastCommitIndex = primitive.sendEvent(true).get();
+    serverProtocols.get(leaderId).reconnect();
+
+    // then
+    waitUntil(() -> commitIndex.get() >= lastCommitIndex, 200);
+  }
+
+  @Test
+  public void shouldFailOverOnLeaderDisconnect() throws Throwable {
+    final List<RaftServer> servers = createServers(3);
+    final RaftServer leader = getLeader(servers).get();
+    final MemberId leaderId = leader.getContext().getCluster().getMember().memberId();
+
+    // when
+    serverProtocols.get(leaderId).disconnect();
+
+    // then
+    waitUntil(
+        () -> getLeader(servers).map(newLeader -> !newLeader.equals(leader)).orElse(false), 100);
+  }
+
+  @Test
+  public void shouldTriggerHeartbeatTimeouts() throws Throwable {
+    final List<RaftServer> servers = createServers(3);
+    final List<RaftServer> followers = getFollowers(servers);
+    final MemberId followerId = followers.get(0).getContext().getCluster().getMember().memberId();
+
+    // when
+    final TestRaftServerProtocol followerServer = serverProtocols.get(followerId);
+    Mockito.clearInvocations(followerServer);
+    followerServer.disconnect();
+
+    // then
+    // should send poll requests to 2 nodes
+    verify(followerServer, timeout(5000).atLeast(2)).poll(any(), any());
+  }
+
+  @Test
+  public void shouldReSendPollRequestOnTimeouts() throws Throwable {
+    final List<RaftServer> servers = createServers(3);
+    final List<RaftServer> followers = getFollowers(servers);
+    final MemberId followerId = followers.get(0).getContext().getCluster().getMember().memberId();
+
+    // when
+    final TestRaftServerProtocol followerServer = serverProtocols.get(followerId);
+    Mockito.clearInvocations(followerServer);
+    followerServer.disconnect();
+    verify(followerServer, timeout(5000).atLeast(2)).poll(any(), any());
+    Mockito.clearInvocations(followerServer);
+
+    // then
+    // no response for previous poll requests, so send them again
+    verify(followerServer, timeout(5000).atLeast(2)).poll(any(), any());
   }
 
   private static final class FakeStatistics extends StorageStatistics {

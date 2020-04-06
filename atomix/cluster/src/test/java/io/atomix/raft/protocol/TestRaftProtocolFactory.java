@@ -16,6 +16,8 @@
  */
 package io.atomix.raft.protocol;
 
+import static org.mockito.Mockito.spy;
+
 import com.google.common.collect.Maps;
 import io.atomix.cluster.MemberId;
 import io.atomix.utils.concurrent.ThreadContext;
@@ -38,7 +40,7 @@ public class TestRaftProtocolFactory {
    * @param memberId the client member identifier
    * @return a new test client protocol
    */
-  public RaftClientProtocol newClientProtocol(final MemberId memberId) {
+  public TestRaftClientProtocol newClientProtocol(final MemberId memberId) {
     return new TestRaftClientProtocol(memberId, servers, clients, context);
   }
 
@@ -48,7 +50,14 @@ public class TestRaftProtocolFactory {
    * @param memberId the server member identifier
    * @return a new test server protocol
    */
-  public RaftServerProtocol newServerProtocol(final MemberId memberId) {
+  public TestRaftServerProtocol newServerProtocol(final MemberId memberId) {
     return new TestRaftServerProtocol(memberId, servers, clients, context);
+  }
+
+  public TestRaftServerProtocol newSpyServerProtocol(final MemberId memberId) {
+    final TestRaftServerProtocol spyProtocol =
+        spy(new TestRaftServerProtocol(memberId, servers, clients, context));
+    servers.put(memberId, spyProtocol);
+    return spyProtocol;
   }
 }
